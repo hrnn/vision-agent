@@ -320,7 +320,7 @@ def od_sam2_video_tracking(
     # We save the RLE for display purposes, re-calculating RLE can get very expensive.
     # Deleted here because we are returning the numpy masks instead
     display_data = []
-    for frame_idx, frame in enumerate(detections_combined):
+    for frame_idx, frame in enumerate(return_data):
         display_frame_data = []
         for obj in frame:
             display_frame_data.append(
