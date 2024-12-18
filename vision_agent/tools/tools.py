@@ -334,7 +334,6 @@ def od_sam2_video_tracking(
                 }
             )
         display_data.append(display_frame_data)
-        _LOGGER.debug(f"Frame {frame_idx}: Prepared display data with {len(display_frame_data)} objects.")
 
     _LOGGER.debug("Preparing final return data.")
 
