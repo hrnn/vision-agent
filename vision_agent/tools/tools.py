@@ -249,6 +249,7 @@ def od_sam2_video_tracking(
     # Convert frames to bytes for each part
     buffer_bytes_part1 = frames_to_bytes(part1_frames)
     buffer_bytes_part2 = frames_to_bytes(part2_frames)
+    buffer_bytes = frames_to_bytes(frames)
     _LOGGER.debug("Converted frames to bytes for both parts.")
 
     # Prepare payloads for each part
@@ -261,6 +262,7 @@ def od_sam2_video_tracking(
     # Prepare files for each part
     files_part1 = [("video", buffer_bytes_part1)]
     files_part2 = [("video", buffer_bytes_part2)]
+    files  = [("video", buffer_bytes)]
     _LOGGER.debug("Prepared files for both parts.")
 
     # Prepare metadata
@@ -337,8 +339,7 @@ def od_sam2_video_tracking(
     _LOGGER.debug("Preparing final return data.")
 
     final_return = {
-        "files_part1": files_part1,
-        "files_part2": files_part2,
+        "files": files,
         "return_data": return_data,
         "display_data": detections_combined,  # Changed from detections to detections_combined
     }
