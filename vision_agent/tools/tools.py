@@ -125,6 +125,7 @@ class ODModels(str, Enum):
     OWLV2 = "owlv2"
 
 
+
 def od_sam2_video_tracking(
     od_model: ODModels,
     prompt: str,
@@ -132,42 +133,59 @@ def od_sam2_video_tracking(
     chunk_length: Optional[int] = 10,
     fine_tune_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    results: List[Optional[List[Dict[str, Any]]]] = [None] * len(frames)
+    _LOGGER.debug(
+        f"Parameters received - od_model: {od_model}, prompt: {prompt}, "
+        f"number of frames: {len(frames)}, chunk_length: {chunk_length}, fine_tune_id: {fine_tune_id}"
+    )
 
+    results: List[Optional[List[Dict[str, Any]]]] = [None] * len(frames)
+    _LOGGER.debug(f"Initialized results array with length {len(results)}.")
+
+    # Determine the step based on chunk_length
     if chunk_length is None:
         step = 1  # Process every frame
+        _LOGGER.debug("chunk_length is None. Setting step to 1 to process every frame.")
     elif chunk_length <= 0:
+        _LOGGER.error("chunk_length must be a positive integer or None.")
         raise ValueError("chunk_length must be a positive integer or None.")
     else:
         step = chunk_length  # Process frames with the specified step size
+        _LOGGER.debug(f"chunk_length is {chunk_length}. Setting step to {step}.")
 
+    # Populate the results array with detection data
     for idx in range(0, len(frames), step):
+        _LOGGER.debug(f"Processing frame index: {idx} using model: {od_model}.")
         if od_model == ODModels.COUNTGD:
             results[idx] = countgd_object_detection(prompt=prompt, image=frames[idx])
             function_name = "countgd_object_detection"
+            _LOGGER.debug(f"Frame {idx}: countgd_object_detection completed.")
         elif od_model == ODModels.OWLV2:
             results[idx] = owl_v2_image(
                 prompt=prompt, image=frames[idx], fine_tune_id=fine_tune_id
             )
             function_name = "owl_v2_image"
+            _LOGGER.debug(f"Frame {idx}: owl_v2_image completed.")
         elif od_model == ODModels.FLORENCE2:
             results[idx] = florence2_sam2_image(
                 prompt=prompt, image=frames[idx], fine_tune_id=fine_tune_id
             )
             function_name = "florence2_sam2_image"
         else:
+            _LOGGER.error(f"Object detection model '{od_model}' is not implemented.")
             raise NotImplementedError(
                 f"Object detection model '{od_model}' is not implemented."
             )
 
     image_size = frames[0].shape[:2]
+    _LOGGER.debug(f"Image size determined as: {image_size}.")
 
     def _transform_detections(
         input_list: List[Optional[List[Dict[str, Any]]]]
     ) -> List[Optional[Dict[str, Any]]]:
+        _LOGGER.debug("Transforming detections.")
         output_list: List[Optional[Dict[str, Any]]] = []
 
-        for _, frame in enumerate(input_list):
+        for idx, frame in enumerate(input_list):
             if frame is not None:
                 labels = [detection["label"] for detection in frame]
                 bboxes = [
@@ -186,37 +204,123 @@ def od_sam2_video_tracking(
 
         return output_list
 
-    output = _transform_detections(results)
+    # Function to find all indices where results are not None (X)
+    x_indices = [idx for idx, res in enumerate(results) if res is not None]
+    _LOGGER.debug(f"Non-None detection indices: {x_indices}.")
 
-    buffer_bytes = frames_to_bytes(frames)
-    files = [("video", buffer_bytes)]
-    payload = {"bboxes": json.dumps(output), "chunk_length": chunk_length}
-    metadata = {"function_name": function_name}
+    if not x_indices:
+        _LOGGER.error("No detections found in any frame.")
+        raise ValueError("No detections found in any frame.")
 
-    detections = send_task_inference_request(
-        payload,
-        "sam2",
-        files=files,
-        metadata=metadata,
+    # Determine the desired split point based on frame midpoint
+    total_frames = len(frames)
+    mid_frame = total_frames // 2
+    _LOGGER.debug(f"Total frames: {total_frames}, Frame midpoint: {mid_frame}.")
+
+    # Find the 'X' index closest to the frame midpoint
+    closest_split_idx = min(x_indices, key=lambda x: abs(x - mid_frame))
+    _LOGGER.debug(f"Closest 'X' to midpoint ({mid_frame}): {closest_split_idx}.")
+
+    # Determine the split index
+    split_indices = [closest_split_idx, total_frames]
+    _LOGGER.debug(f"Split indices determined: {split_indices}.")
+
+    # Split the results and frames into two parts
+    part1_results = results[:split_indices[0]]
+    part2_results = results[split_indices[0]:]
+    _LOGGER.debug(
+        f"Split results into part1 (length {len(part1_results)}) "
+        f"and part2 (length {len(part2_results)})."
     )
 
+    # Split the frames accordingly
+    part1_frames = frames[:split_indices[0]]
+    part2_frames = frames[split_indices[0]:]
+    _LOGGER.debug(
+        f"Split frames into part1 (length {len(part1_frames)}) "
+        f"and part2 (length {len(part2_frames)})."
+    )
+
+    # Transform detections for each part
+    part1_output = _transform_detections(part1_results)
+    part2_output = _transform_detections(part2_results)
+    _LOGGER.debug("Transformed detections for both parts.")
+
+    # Convert frames to bytes for each part
+    buffer_bytes_part1 = frames_to_bytes(part1_frames)
+    buffer_bytes_part2 = frames_to_bytes(part2_frames)
+    _LOGGER.debug("Converted frames to bytes for both parts.")
+
+    # Prepare payloads for each part
+    payload_part1 = {"bboxes": json.dumps(part1_output), "chunk_length": chunk_length}
+    payload_part2 = {"bboxes": json.dumps(part2_output), "chunk_length": chunk_length}
+    _LOGGER.debug("Prepared payloads for both parts.")
+    _LOGGER.debug(payload_part1)
+    _LOGGER.debug(payload_part2)
+
+    # Prepare files for each part
+    files_part1 = [("video", buffer_bytes_part1)]
+    files_part2 = [("video", buffer_bytes_part2)]
+    _LOGGER.debug("Prepared files for both parts.")
+
+    # Prepare metadata
+    metadata = {"function_name": function_name}
+    _LOGGER.debug(f"Metadata prepared: {metadata}.")
+
+    # Initialize detections list
+    detections_combined = []
+
+    # Process Part 1
+    _LOGGER.debug("Starting processing of Part 1.")
+    detections_part1 = send_task_inference_request(
+        payload_part1,
+        "sam2",
+        files=files_part1,
+        metadata=metadata,
+    )
+    _LOGGER.debug(f"Completed processing of Part 1. Received {len(detections_part1)} detections.")
+    detections_combined.extend(detections_part1)
+
+    # Process Part 2
+    _LOGGER.debug("Starting processing of Part 2.")
+    detections_part2 = send_task_inference_request(
+        payload_part2,
+        "sam2",
+        files=files_part2,
+        metadata=metadata,
+    )
+    _LOGGER.debug(f"Completed processing of Part 2. Received {len(detections_part2)} detections.")
+    detections_combined.extend(detections_part2)
+
+    # Now, detections_combined contains detections from both parts
+    _LOGGER.debug(f"Total combined detections: {len(detections_combined)}.")
+
     return_data = []
-    for frame in detections:
+    for frame_idx, frame in enumerate(detections_combined):
         return_frame_data = []
         for detection in frame:
             mask = rle_decode_array(detection["mask"])
-            label = str(detection["id"]) + ": " + detection["label"]
+            label = f"{detection['id']}: {detection['label']}"
             return_frame_data.append(
-                {"label": label, "mask": mask, "score": 1.0, "rle": detection["mask"]}
+                {
+                    "label": label,
+                    "mask": mask,
+                    "score": 1.0,
+                    "rle": detection["mask"],
+                }
             )
         return_data.append(return_frame_data)
-    return_data = add_bboxes_from_masks(return_data)
-    return_data = nms(return_data, iou_threshold=0.95)
 
-    # We save the RLE for display purposes, re-calculting RLE can get very expensive.
+    return_data = add_bboxes_from_masks(return_data)
+    _LOGGER.debug("Added bounding boxes from masks.")
+
+    return_data = nms(return_data, iou_threshold=0.95)
+    _LOGGER.debug("Applied Non-Maximum Suppression (NMS) to return_data.")
+
+    # We save the RLE for display purposes, re-calculating RLE can get very expensive.
     # Deleted here because we are returning the numpy masks instead
     display_data = []
-    for frame in return_data:
+    for frame_idx, frame in enumerate(detections_combined):
         display_frame_data = []
         for obj in frame:
             display_frame_data.append(
@@ -224,13 +328,24 @@ def od_sam2_video_tracking(
                     "label": obj["label"],
                     "score": obj["score"],
                     "bbox": denormalize_bbox(obj["bbox"], image_size),
-                    "mask": obj["rle"],
+                    "mask": obj["mask"],
                 }
             )
-            del obj["rle"]
         display_data.append(display_frame_data)
+        _LOGGER.debug(f"Frame {frame_idx}: Prepared display data with {len(display_frame_data)} objects.")
 
-    return {"files": files, "return_data": return_data, "display_data": detections}
+    _LOGGER.debug("Preparing final return data.")
+
+    final_return = {
+        "files_part1": files_part1,
+        "files_part2": files_part2,
+        "return_data": return_data,
+        "display_data": detections_combined,  # Changed from detections to detections_combined
+    }
+
+    _LOGGER.debug(f"Function completed successfully. Returning data keys: {list(final_return.keys())}.")
+
+    return final_return
 
 
 def owl_v2_image(
