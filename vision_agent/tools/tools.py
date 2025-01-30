@@ -222,7 +222,7 @@ def sam2(
     ret = _sam2(image, detections, image_size)
     _display_tool_trace(
         sam2.__name__,
-        {},
+        {"detections": detections},
         ret["display_data"],
         ret["files"],
     )
@@ -234,16 +234,24 @@ def od_sam2_video_tracking(
     od_model: ODModels,
     prompt: str,
     frames: List[np.ndarray],
-    chunk_length: Optional[int] = 10,
+    chunk_length: Optional[int] = 50,
     fine_tune_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    SEGMENT_SIZE = 50
-    OVERLAP = 1  # Number of overlapping frames between segments
+    chunk_length = 50 if chunk_length is None else chunk_length
+    segment_size = chunk_length
+    # Number of overlapping frames between segments
+    overlap = 1
+    # chunk_length needs to be segment_size + 1 or else on the last segment it will
+    # run the OD model again and merging will not work
+    chunk_length = chunk_length + 1
+
+    if len(frames) == 0 or not isinstance(frames, List):
+        return {"files": [], "return_data": [], "display_data": []}
 
     image_size = frames[0].shape[:2]
 
     # Split frames into segments with overlap
-    segments = split_frames_into_segments(frames, SEGMENT_SIZE, OVERLAP)
+    segments = split_frames_into_segments(frames, segment_size, overlap)
 
     def _apply_object_detection(  # inner method to avoid circular importing issues.
         od_model: ODModels,
@@ -290,6 +298,14 @@ def od_sam2_video_tracking(
             )
             function_name = "florence2_object_detection"
 
+        elif od_model == ODModels.AGENTIC:
+            segment_results = agentic_object_detection(
+                prompt=prompt,
+                image=segment_frames[frame_number],
+                fine_tune_id=fine_tune_id,
+            )
+            function_name = "agentic_object_detection"
+
         elif od_model == ODModels.CUSTOM:
             segment_results = custom_object_detection(
                 deployment_id=fine_tune_id,
@@ -306,18 +322,29 @@ def od_sam2_video_tracking(
 
     # Process each segment and collect detections
     detections_per_segment: List[Any] = []
-    for segment_index, segment in enumerate(segments):
-        segment_detections = process_segment(
-            segment_frames=segment,
-            od_model=od_model,
-            prompt=prompt,
-            fine_tune_id=fine_tune_id,
-            chunk_length=chunk_length,
-            image_size=image_size,
-            segment_index=segment_index,
-            object_detection_tool=_apply_object_detection,
-        )
-        detections_per_segment.append(segment_detections)
+    with ThreadPoolExecutor() as executor:
+        futures = {
+            executor.submit(
+                process_segment,
+                segment_frames=segment,
+                od_model=od_model,
+                prompt=prompt,
+                fine_tune_id=fine_tune_id,
+                chunk_length=chunk_length,
+                image_size=image_size,
+                segment_index=segment_index,
+                object_detection_tool=_apply_object_detection,
+            ): segment_index
+            for segment_index, segment in enumerate(segments)
+        }
+
+        for future in as_completed(futures):
+            segment_index = futures[future]
+            detections_per_segment.append((segment_index, future.result()))
+
+    detections_per_segment = [
+        x[1] for x in sorted(detections_per_segment, key=lambda x: x[0])
+    ]
 
     merged_detections = merge_segments(detections_per_segment)
     post_processed = post_process(merged_detections, image_size)
@@ -382,7 +409,7 @@ def _owlv2_object_detection(
         {
             "label": bbox["label"],
             "bbox": normalize_bbox(bbox["bounding_box"], image_size),
-            "score": bbox["score"],
+            "score": round(bbox["score"], 2),
         }
         for bbox in bboxes
     ]
@@ -390,7 +417,7 @@ def _owlv2_object_detection(
         {
             "label": bbox["label"],
             "bbox": bbox["bounding_box"],
-            "score": bbox["score"],
+            "score": round(bbox["score"], 2),
         }
         for bbox in bboxes
     ]
@@ -519,7 +546,7 @@ def owlv2_sam2_instance_segmentation(
 def owlv2_sam2_video_tracking(
     prompt: str,
     frames: List[np.ndarray],
-    chunk_length: Optional[int] = 10,
+    chunk_length: Optional[int] = 25,
     fine_tune_id: Optional[str] = None,
 ) -> List[List[Dict[str, Any]]]:
     """'owlv2_sam2_video_tracking' is a tool that can track and segment multiple
@@ -574,7 +601,7 @@ def owlv2_sam2_video_tracking(
     )
     _display_tool_trace(
         owlv2_sam2_video_tracking.__name__,
-        {},
+        {"prompt": prompt, "chunk_length": chunk_length},
         ret["display_data"],
         ret["files"],
     )
@@ -587,14 +614,14 @@ def owlv2_sam2_video_tracking(
 def florence2_object_detection(
     prompt: str, image: np.ndarray, fine_tune_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """'florence2_object_detection' is a tool that can detect multiple
-    objects given a text prompt which can be object names or caption. You
-    can optionally separate the object names in the text with commas. It returns a list
-    of bounding boxes with normalized coordinates, label names and associated
-    confidence scores of 1.0.
+    """'florence2_object_detection' is a tool that can detect multiple objects given a
+    text prompt which can be object names or caption. You can optionally separate the
+    object names in the text with commas. It returns a list of bounding boxes with
+    normalized coordinates, label names and associated confidence scores of 1.0.
 
     Parameters:
-        prompt (str): The prompt to ground to the image.
+        prompt (str): The prompt to ground to the image. Use exclusive categories that
+            do not overlap such as 'person, car' and NOT 'person, athlete'.
         image (np.ndarray): The image to used to detect objects
         fine_tune_id (Optional[str]): If you have a fine-tuned model, you can pass the
             fine-tuned model ID here to use it.
@@ -673,7 +700,8 @@ def florence2_sam2_instance_segmentation(
     1.0.
 
     Parameters:
-        prompt (str): The prompt to ground to the image.
+        prompt (str): The prompt to ground to the image. Use exclusive categories that
+            do not overlap such as 'person, car' and NOT 'person, athlete'.
         image (np.ndarray): The image to ground the prompt to.
         fine_tune_id (Optional[str]): If you have a fine-tuned model, you can pass the
             fine-tuned model ID here to use it.
@@ -751,7 +779,7 @@ def florence2_sam2_instance_segmentation(
 def florence2_sam2_video_tracking(
     prompt: str,
     frames: List[np.ndarray],
-    chunk_length: Optional[int] = 10,
+    chunk_length: Optional[int] = 25,
     fine_tune_id: Optional[str] = None,
 ) -> List[List[Dict[str, Any]]]:
     """'florence2_sam2_video_tracking' is a tool that can track and segment multiple
@@ -761,7 +789,8 @@ def florence2_sam2_video_tracking(
     is useful for tracking and counting without duplicating counts.
 
     Parameters:
-        prompt (str): The prompt to ground to the video.
+        prompt (str): The prompt to ground to the image. Use exclusive categories that
+            do not overlap such as 'person, car' and NOT 'person, athlete'.
         frames (List[np.ndarray]): The list of frames to ground the prompt to.
         chunk_length (Optional[int]): The number of frames to re-run florence2 to find
             new objects.
@@ -1089,7 +1118,7 @@ def countgd_sam2_instance_segmentation(
 def countgd_sam2_video_tracking(
     prompt: str,
     frames: List[np.ndarray],
-    chunk_length: Optional[int] = 10,
+    chunk_length: Optional[int] = 25,
 ) -> List[List[Dict[str, Any]]]:
     """'countgd_sam2_video_tracking' is a tool that can track and segment multiple
     objects in a video given a text prompt such as category names or referring
@@ -1301,7 +1330,7 @@ def custom_object_detection(
 def custom_od_sam2_video_tracking(
     deployment_id: str,
     frames: List[np.ndarray],
-    chunk_length: Optional[int] = 10,
+    chunk_length: Optional[int] = 25,
 ) -> List[List[Dict[str, Any]]]:
     """'custom_od_sam2_video_tracking' is a tool that can segment multiple objects given a
     custom model with predefined category names.
@@ -1671,7 +1700,7 @@ def video_temporal_localization(
     prompt: str,
     frames: List[np.ndarray],
     model: str = "qwen2vl",
-    chunk_length_frames: Optional[int] = 2,
+    chunk_length_frames: int = 2,
 ) -> List[float]:
     """'video_temporal_localization' will run qwen2vl on each chunk_length_frames
     value selected for the video. It can detect multiple objects independently per
@@ -1685,7 +1714,7 @@ def video_temporal_localization(
         frames (List[np.ndarray]): The reference frames used for the question
         model (str): The model to use for the inference. Valid values are
             'qwen2vl', 'gpt4o'.
-        chunk_length_frames (Optional[int]): length of each chunk in frames
+        chunk_length_frames (int): length of each chunk in frames
 
     Returns:
         List[float]: A list of floats with a value of 1.0 if the objects to be found
@@ -1704,19 +1733,48 @@ def video_temporal_localization(
         "model": model,
         "function_name": "video_temporal_localization",
     }
-    if chunk_length_frames is not None:
-        payload["chunk_length_frames"] = chunk_length_frames
+    payload["chunk_length_frames"] = chunk_length_frames
 
-    data = send_inference_request(
-        payload, "video-temporal-localization", files=files, v2=True
-    )
+    segments = split_frames_into_segments(frames, segment_size=50, overlap=0)
+
+    def _apply_temporal_localization(
+        segment: List[np.ndarray],
+    ) -> List[float]:
+        segment_buffer_bytes = [("video", frames_to_bytes(segment))]
+        data = send_inference_request(
+            payload, "video-temporal-localization", files=segment_buffer_bytes, v2=True
+        )
+        chunked_data = [cast(float, value) for value in data]
+
+        full_data = []
+        for value in chunked_data:
+            full_data.extend([value] * chunk_length_frames)
+
+        return full_data[: len(segment)]
+
+    with ThreadPoolExecutor() as executor:
+        futures = {
+            executor.submit(_apply_temporal_localization, segment): segment_index
+            for segment_index, segment in enumerate(segments)
+        }
+
+        localization_per_segment = []
+        for future in as_completed(futures):
+            segment_index = futures[future]
+            localization_per_segment.append((segment_index, future.result()))
+
+    localization_per_segment = [
+        x[1] for x in sorted(localization_per_segment, key=lambda x: x[0])  # type: ignore
+    ]
+    localizations = cast(List[float], [e for o in localization_per_segment for e in o])
+
     _display_tool_trace(
         video_temporal_localization.__name__,
         payload,
-        data,
+        localization_per_segment,
         files,
     )
-    return [cast(float, value) for value in data]
+    return localizations
 
 
 def vit_image_classification(image: np.ndarray) -> Dict[str, Any]:
@@ -2002,16 +2060,18 @@ def flux_image_inpainting(
     mask: np.ndarray,
 ) -> np.ndarray:
     """'flux_image_inpainting' performs image inpainting to fill the masked regions,
-    given by mask, in the image, given image based on the text prompt and surrounding image context.
-    It can be used to edit regions of an image according to the prompt given.
+    given by mask, in the image, given image based on the text prompt and surrounding
+    image context. It can be used to edit regions of an image according to the prompt
+    given.
 
     Parameters:
         prompt (str): A detailed text description guiding what should be generated
-            in the masked area. More detailed and specific prompts typically yield better results.
-        image (np.ndarray): The source image to be inpainted.
-            The image will serve as the base context for the inpainting process.
-        mask (np.ndarray): A binary mask image with 0's and 1's,
-            where 1 indicates areas to be inpainted and 0 indicates areas to be preserved.
+            in the masked area. More detailed and specific prompts typically yield
+            better results.
+        image (np.ndarray): The source image to be inpainted. The image will serve as
+            the base context for the inpainting process.
+        mask (np.ndarray): A binary mask image with 0's and 1's, where 1 indicates
+            areas to be inpainted and 0 indicates areas to be preserved.
 
     Returns:
         np.ndarray: The generated image(s) as a numpy array in RGB format with values
@@ -2138,6 +2198,242 @@ def siglip_classification(image: np.ndarray, labels: List[str]) -> Dict[str, Any
         files,
     )
     return response
+
+
+# Agentic OD Tools
+
+
+def _agentic_object_detection(
+    prompt: str,
+    image: np.ndarray,
+    image_size: Tuple[int, ...],
+    image_bytes: Optional[bytes] = None,
+    fine_tune_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if image_bytes is None:
+        image_bytes = numpy_to_bytes(image)
+
+    files = [("image", image_bytes)]
+    payload = {
+        "prompts": [s.strip() for s in prompt.split(",")],
+        "model": "agentic",
+    }
+    metadata = {"function_name": "agentic_object_detection"}
+
+    if fine_tune_id is not None:
+        landing_api = LandingPublicAPI()
+        status = landing_api.check_fine_tuning_job(UUID(fine_tune_id))
+        if status is not JobStatus.SUCCEEDED:
+            raise FineTuneModelIsNotReady(
+                f"Fine-tuned model {fine_tune_id} is not ready yet"
+            )
+
+        # we can only execute fine-tuned models with florence2
+        payload = {
+            "prompts": payload["prompts"],
+            "jobId": fine_tune_id,
+            "model": "florence2",
+        }
+
+    detections = send_task_inference_request(
+        payload,
+        "text-to-object-detection",
+        files=files,
+        metadata=metadata,
+    )
+
+    # get the first frame
+    bboxes = detections[0]
+    bboxes_formatted = [
+        {
+            "label": bbox["label"],
+            "bbox": normalize_bbox(bbox["bounding_box"], image_size),
+            "score": bbox["score"],
+        }
+        for bbox in bboxes
+    ]
+    display_data = [
+        {
+            "label": bbox["label"],
+            "bbox": bbox["bounding_box"],
+            "score": bbox["score"],
+        }
+        for bbox in bboxes
+    ]
+    return {
+        "files": files,
+        "return_data": bboxes_formatted,
+        "display_data": display_data,
+    }
+
+
+def agentic_object_detection(
+    prompt: str,
+    image: np.ndarray,
+    fine_tune_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """'agentic_object_detection' is a tool that can detect and count multiple objects
+    given a text prompt such as category names or referring expressions on images. The
+    categories in text prompt are separated by commas. It returns a list of bounding
+    boxes with normalized coordinates, label names and associated probability scores.
+
+    Parameters:
+        prompt (str): The prompt to ground to the image.
+        image (np.ndarray): The image to ground the prompt to.
+        fine_tune_id (Optional[str]): If you have a fine-tuned model, you can pass the
+            fine-tuned model ID here to use it.
+
+    Returns:
+        List[Dict[str, Any]]: A list of dictionaries containing the score, label, and
+            bounding box of the detected objects with normalized coordinates between 0
+            and 1 (xmin, ymin, xmax, ymax). xmin and ymin are the coordinates of the
+            top-left and xmax and ymax are the coordinates of the bottom-right of the
+            bounding box.
+
+    Example
+    -------
+        >>> agentic_object_detection("car", image)
+        [
+            {'score': 0.99, 'label': 'car', 'bbox': [0.1, 0.11, 0.35, 0.4]},
+            {'score': 0.98, 'label': 'car', 'bbox': [0.2, 0.21, 0.45, 0.5},
+        ]
+    """
+
+    image_size = image.shape[:2]
+    if image_size[0] < 1 or image_size[1] < 1:
+        return []
+
+    ret = _agentic_object_detection(
+        prompt, image, image_size, fine_tune_id=fine_tune_id
+    )
+
+    _display_tool_trace(
+        agentic_object_detection.__name__,
+        {"prompts": prompt},
+        ret["display_data"],
+        ret["files"],
+    )
+    return ret["return_data"]  # type: ignore
+
+
+def agentic_sam2_instance_segmentation(
+    prompt: str, image: np.ndarray
+) -> List[Dict[str, Any]]:
+    """'agentic_sam2_instance_segmentation' is a tool that can detect and count multiple
+    instances of objects given a text prompt such as category names or referring
+    expressions on images. The categories in text prompt are separated by commas. It
+    returns a list of bounding boxes with normalized coordinates, label names, masks
+    and associated probability scores.
+
+    Parameters:
+        prompt (str): The object that needs to be counted.
+        image (np.ndarray): The image that contains multiple instances of the object.
+
+    Returns:
+        List[Dict[str, Any]]: A list of dictionaries containing the score, label,
+            bounding box, and mask of the detected objects with normalized coordinates
+            (xmin, ymin, xmax, ymax). xmin and ymin are the coordinates of the top-left
+            and xmax and ymax are the coordinates of the bottom-right of the bounding box.
+            The mask is binary 2D numpy array where 1 indicates the object and 0 indicates
+            the background.
+
+    Example
+    -------
+        >>> agentic_sam2_instance_segmentation("flower", image)
+        [
+            {
+                'score': 0.49,
+                'label': 'flower',
+                'bbox': [0.1, 0.11, 0.35, 0.4],
+                'mask': array([[0, 0, 0, ..., 0, 0, 0],
+                    [0, 0, 0, ..., 0, 0, 0],
+                    ...,
+                    [0, 0, 0, ..., 0, 0, 0],
+                    [0, 0, 0, ..., 0, 0, 0]], dtype=uint8),
+            },
+        ]
+    """
+
+    od_ret = _agentic_object_detection(prompt, image, image.shape[:2])
+    seg_ret = _sam2(
+        image, od_ret["return_data"], image.shape[:2], image_bytes=od_ret["files"][0][1]
+    )
+
+    _display_tool_trace(
+        agentic_sam2_instance_segmentation.__name__,
+        {
+            "prompts": prompt,
+        },
+        seg_ret["display_data"],
+        seg_ret["files"],
+    )
+
+    return seg_ret["return_data"]  # type: ignore
+
+
+def agentic_sam2_video_tracking(
+    prompt: str,
+    frames: List[np.ndarray],
+    chunk_length: Optional[int] = 25,
+    fine_tune_id: Optional[str] = None,
+) -> List[List[Dict[str, Any]]]:
+    """'agentic_sam2_video_tracking' is a tool that can track and segment multiple
+    objects in a video given a text prompt such as category names or referring
+    expressions. The categories in the text prompt are separated by commas. It returns
+    a list of bounding boxes, label names, masks and associated probability scores and
+    is useful for tracking and counting without duplicating counts.
+
+    Parameters:
+        prompt (str): The prompt to ground to the image.
+        frames (List[np.ndarray]): The list of frames to ground the prompt to.
+        chunk_length (Optional[int]): The number of frames to re-run agentic object detection to
+            to find new objects.
+        fine_tune_id (Optional[str]): If you have a fine-tuned model, you can pass the
+            fine-tuned model ID here to use it.
+
+    Returns:
+        List[List[Dict[str, Any]]]: A list of list of dictionaries containing the
+            label, segmentation mask and bounding boxes. The outer list represents each
+            frame and the inner list is the entities per frame. The detected objects
+            have normalized coordinates between 0 and 1 (xmin, ymin, xmax, ymax). xmin
+            and ymin are the coordinates of the top-left and xmax and ymax are the
+            coordinates of the bottom-right of the bounding box. The mask is binary 2D
+            numpy array where 1 indicates the object and 0 indicates the background.
+            The label names are prefixed with their ID represent the total count.
+
+    Example
+    -------
+        >>> agentic_sam2_video_tracking("dinosaur", frames)
+        [
+            [
+                {
+                    'label': '0: dinosaur',
+                    'bbox': [0.1, 0.11, 0.35, 0.4],
+                    'mask': array([[0, 0, 0, ..., 0, 0, 0],
+                        [0, 0, 0, ..., 0, 0, 0],
+                        ...,
+                        [0, 0, 0, ..., 0, 0, 0],
+                        [0, 0, 0, ..., 0, 0, 0]], dtype=uint8),
+                },
+            ],
+            ...
+        ]
+    """
+
+    ret = od_sam2_video_tracking(
+        ODModels.AGENTIC,
+        prompt=prompt,
+        frames=frames,
+        chunk_length=chunk_length,
+        fine_tune_id=fine_tune_id,
+    )
+    _display_tool_trace(
+        agentic_sam2_video_tracking.__name__,
+        {},
+        ret["display_data"],
+        ret["files"],
+    )
+    return ret["return_data"]  # type: ignore
 
 
 def minimum_distance(
@@ -2400,7 +2696,7 @@ def save_image(image: np.ndarray, file_path: str) -> None:
 
 
 def save_video(
-    frames: List[np.ndarray], output_video_path: Optional[str] = None, fps: float = 1
+    frames: List[np.ndarray], output_video_path: Optional[str] = None, fps: float = 5
 ) -> str:
     """'save_video' is a utility function that saves a list of frames as a mp4 video file on disk.
 
@@ -2503,7 +2799,15 @@ def overlay_bounding_boxes(
             "Number of unique labels exceeds the number of available colors. Some labels may have the same color."
         )
 
-    color = {label: COLORS[i % len(COLORS)] for i, label in enumerate(labels)}
+    use_tracking_label = False
+    if all([":" in label for label in labels]):
+        unique_labels = set([label.split(":")[1].strip() for label in labels])
+        use_tracking_label = True
+        colors = {
+            label: COLORS[i % len(COLORS)] for i, label in enumerate(unique_labels)
+        }
+    else:
+        colors = {label: COLORS[i % len(COLORS)] for i, label in enumerate(labels)}
 
     frame_out = []
     for i, frame in enumerate(medias_int):
@@ -2514,7 +2818,7 @@ def overlay_bounding_boxes(
 
         # if more than 50 boxes use small boxes to indicate objects else use regular boxes
         if len(bboxes) > 50:
-            pil_image = _plot_counting(pil_image, bboxes, color)
+            pil_image = _plot_counting(pil_image, bboxes, colors, use_tracking_label)
         else:
             width, height = pil_image.size
             fontsize = max(12, int(min(width, height) / 40))
@@ -2529,18 +2833,20 @@ def overlay_bounding_boxes(
             )
 
             for elt in bboxes:
+                if use_tracking_label:
+                    color = colors[elt["label"].split(":")[1].strip()]
+                else:
+                    color = colors[elt["label"]]
                 label = elt["label"]
                 box = elt["bbox"]
                 scores = elt["score"]
 
                 # denormalize the box if it is normalized
                 box = denormalize_bbox(box, (height, width))
-                draw.rectangle(box, outline=color[label], width=4)
+                draw.rectangle(box, outline=color, width=4)
                 text = f"{label}: {scores:.2f}"
                 text_box = draw.textbbox((box[0], box[1]), text=text, font=font)
-                draw.rectangle(
-                    (box[0], box[1], text_box[2], text_box[3]), fill=color[label]
-                )
+                draw.rectangle((box[0], box[1], text_box[2], text_box[3]), fill=color)
                 draw.text((box[0], box[1]), text, fill="black", font=font)
 
         frame_out.append(np.array(pil_image))
@@ -2623,7 +2929,16 @@ def overlay_segmentation_masks(
     for mask_i in masks_int:
         for mask_j in mask_i:
             labels.add(mask_j["label"])
-    color = {label: COLORS[i % len(COLORS)] for i, label in enumerate(labels)}
+
+    use_tracking_label = False
+    if all([":" in label for label in labels]):
+        use_tracking_label = True
+        unique_labels = set([label.split(":")[1].strip() for label in labels])
+        colors = {
+            label: COLORS[i % len(COLORS)] for i, label in enumerate(unique_labels)
+        }
+    else:
+        colors = {label: COLORS[i % len(COLORS)] for i, label in enumerate(labels)}
 
     width, height = Image.fromarray(medias_int[0]).size
     fontsize = max(12, int(min(width, height) / 40))
@@ -2637,12 +2952,16 @@ def overlay_segmentation_masks(
         pil_image = Image.fromarray(frame.astype(np.uint8)).convert("RGBA")
         for elt in masks_int[i]:
             mask = elt["mask"]
+            if use_tracking_label:
+                color = colors[elt["label"].split(":")[1].strip()]
+            else:
+                color = colors[elt["label"]]
             label = elt["label"]
             tracking_lbl = elt.get(secondary_label_key, None)
 
             # Create semi-transparent mask overlay
             np_mask = np.zeros((pil_image.size[1], pil_image.size[0], 4))
-            np_mask[mask > 0, :] = color[label] + (255 * 0.7,)
+            np_mask[mask > 0, :] = color + (255 * 0.7,)
             mask_img = Image.fromarray(np_mask.astype(np.uint8))
             pil_image = Image.alpha_composite(pil_image, mask_img)
 
@@ -2654,7 +2973,7 @@ def overlay_segmentation_masks(
             border_mask = np.zeros(
                 (pil_image.size[1], pil_image.size[0], 4), dtype=np.uint8
             )
-            cv2.drawContours(border_mask, contours, -1, color[label] + (255,), 8)
+            cv2.drawContours(border_mask, contours, -1, color + (255,), 8)
             border_img = Image.fromarray(border_mask)
             pil_image = Image.alpha_composite(pil_image, border_img)
 
@@ -2669,7 +2988,7 @@ def overlay_segmentation_masks(
                 )
                 if x != 0 and y != 0:
                     text_box = draw.textbbox((x, y), text=text, font=font)
-                    draw.rectangle((x, y, text_box[2], text_box[3]), fill=color[label])
+                    draw.rectangle((x, y, text_box[2], text_box[3]), fill=color)
                     draw.text((x, y), text, fill="black", font=font)
         frame_out.append(np.array(pil_image))
     return_frame = frame_out[0] if len(frame_out) == 1 else frame_out
@@ -2726,6 +3045,7 @@ def _plot_counting(
     image: Image.Image,
     bboxes: List[Dict[str, Any]],
     colors: Dict[str, Tuple[int, int, int]],
+    use_tracking_label: bool = False,
 ) -> Image.Image:
     width, height = image.size
     fontsize = max(12, int(min(width, height) / 40))
@@ -2735,7 +3055,12 @@ def _plot_counting(
         fontsize,
     )
     for i, elt in enumerate(bboxes, 1):
-        label = f"{i}"
+        if use_tracking_label:
+            label = elt["label"].split(":")[0]
+            color = colors[elt["label"].split(":")[1].strip()]
+        else:
+            label = f"{i}"
+            color = colors[elt["label"]]
         box = elt["bbox"]
 
         # denormalize the box if it is normalized
@@ -2756,7 +3081,7 @@ def _plot_counting(
         text_y1 = cy + text_height / 2
 
         # Draw the rectangle encapsulating the text
-        draw.rectangle((text_x0, text_y0, text_x1, text_y1), fill=colors[elt["label"]])
+        draw.rectangle((text_x0, text_y0, text_x1, text_y1), fill=color)
 
         # Draw the text at the center of the bounding box
         draw.text(

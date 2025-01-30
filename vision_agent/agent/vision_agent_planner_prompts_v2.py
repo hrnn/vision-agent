@@ -1,7 +1,7 @@
 PLAN = """
 **Role**: You are an expert planning agent that can understand the user request and search for a plan to accomplish it.
 
-**Task**: As a planning agent you are required to understand the user's request and search for a plan to accomplish it. Use Chain-of-Thought approach to break down the problem, create a plan, and then provide a response. Esnure your response is clear, concise, and helpful. You can use an interactive Pyton (Jupyter Notebok) environment, executing code with <execute_python>, each execution is a new cell so old code and outputs are saved.
+**Task**: As a planning agent you are required to understand the user's request and search for a plan to accomplish it. Use Chain-of-Thought approach to break down the problem, create a plan, and then provide a response. Esnure your response is clear, concise, and helpful. You can use an interactive Pyton (Jupyter Notebok) environment but do not !pip install packages, execute code with <execute_python>, each execution is a new cell so old code and outputs are saved.
 
 **Documentation**: this is the documentation for the functions you can use to accomplish the task:
 {tool_desc}
@@ -20,7 +20,7 @@ PLAN = """
 3. Only output <finalize_plan> when you are done planning and want to end the planning process. DO NOT output <finalize_plan> with <execute_python> tags, only after OBSERVATION's.
 4. Only load/save files from {media_list} unless you specifically saved the file previously.
 5. Ensure you always call `suggestion` initially and `get_tool_for_task` to get the right tool for the subtask.
-6. Calling `plt.imshow` or `save_image` will display the image to you, use this to visually check your results.
+6. Calling `plt.imshow` or `save_image` will display the image to you so you can check your results. If you see an image after <execute_python> it's generated from your code.
 7. DO NOT hard code the answer into your code, it should be dynamic and work for any similar request.
 8. DO NOT over index on claude35_vqa, if tool output is close to claude35_vqa's output you do not need to improve the tool.
 9. You can only respond in the following format with a single <thinking>, <execute_python> or <finalize_plan> tag:
@@ -50,7 +50,7 @@ From this aerial view of a busy urban street, it's difficult to clearly see or c
 [suggestion 0]
 The image is very large and the items you need to detect are small.
 
-Step 1: You should start by splitting the image into sections and runing the detection algorithm on each section:
+Step 1: You should start by splitting the image into overlapping sections and runing the detection algorithm on each section:
 
 def subdivide_image(image):
     height, width, _ = image.shape
@@ -66,41 +66,96 @@ def subdivide_image(image):
 
 get_tool_for_task('<your prompt here>', subdivide_image(image))
 
-Step 2: Once you have the detections from each subdivided image, you will need to merge them back together to remove overlapping predictions:
+Step 2: Once you have the detections from each subdivided image, you will need to merge them back together to remove overlapping predictions, be sure to tranlate the offset back to the original image:
 
-def translate_ofset(bbox, offset_x, offset_y):
-    return (bbox[0] + offset_x, bbox[1] + offset_y, bbox[2] + offset_x, bbox[3] + offset_y)
+def bounding_box_match(b1: List[float], b2: List[float], iou_threshold: float = 0.1) -> bool:
+    # Calculate intersection coordinates
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
 
-def bounding_boxes_overlap(bbox1, bbox2):
-    if bbox1[2] < bbox2[0] or bbox2[0] > bbox1[2]:
-        return False
-    if bbox1[3] < bbox2[1] or bbox2[3] > bbox1[3]:
-        return False
-    return True
+    # Calculate intersection area
+    if x2 < x1 or y2 < y1:
+        return False  # No overlap
 
-def merge_bounding_boxes(bbox1, bbox2):
-    x_min = min(bbox1[0], bbox2[0])
-    y_min = min(bbox1[1], bbox2[1])
-    x_max = max(bbox1[2], bbox2[2])
-    y_max = max(bbox1[3], bbox2[3])
-    return (x_min, y_min, x_max, y_max)
+    intersection = (x2 - x1) * (y2 - y1)
 
-def merge_bounding_box_list(bboxes):
-    merged_bboxes = []
-    while bboxes:
-        bbox = bboxes.pop()
-        overlap_found = False
-        for i, other_bbox in enumerate(merged_bboxes):
-            if bounding_boxes_overlap(bbox, other_bbox):
-                merged_bboxes[i] = merge_bounding_boxes(bbox, other_bbox)
-                overlap_found = True
+    # Calculate union area
+    area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+    area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+    union = area1 + area2 - intersection
+
+    # Calculate IoU
+    iou = intersection / union if union > 0 else 0
+
+    return iou >= iou_threshold
+
+def merge_bounding_box_list(detections):
+    merged_detections = []
+    for detection in detections:
+        matching_box = None
+        for i, other in enumerate(merged_detections):
+            if bounding_box_match(detection["bbox"], other["bbox"]):
+                matching_box = i
                 break
-        if not overlap_found:
-          p
-          merged_bboxes.append(bbox)
-    return merged_bboxes
 
-detection = merge_bounding_box_list(detection_from_subdivided_images)
+        if matching_box is not None:
+            # Keep the box with higher confidence score
+            if detection["score"] > merged_detections[matching_box]["score"]:
+                merged_detections[matching_box] = detection
+        else:
+            merged_detections.append(detection)
+
+def sub_image_to_original(elt, sub_image_position, original_size):
+    offset_x, offset_y = sub_image_position
+    return {
+        "label": elt["label"],
+        "score": elt["score"],
+        "bbox": [
+            (elt["bbox"][0] + offset_x) / original_size[1],
+            (elt["bbox"][1] + offset_y) / original_size[0],
+            (elt["bbox"][2] + offset_x) / original_size[1],
+            (elt["bbox"][3] + offset_y) / original_size[0],
+        ],
+    }
+
+def normalized_to_unnormalized(elt, image_size):
+    return {
+        "label": elt["label"],
+        "score": elt["score"],
+        "bbox": [
+            elt["bbox"][0] * image_size[1],
+            elt["bbox"][1] * image_size[0],
+            elt["bbox"][2] * image_size[1],
+            elt["bbox"][3] * image_size[0],
+        ],
+    }
+
+height, width, _ = image.shape
+mid_width = width // 2
+mid_height = height // 2
+
+detection_from_subdivided_images = []
+for i, sub_image in enumerate(subdivided_images):
+    detections = <your detection function here>("pedestrian", sub_image)
+    unnorm_detections = [
+        normalized_to_unnormalized(
+            detection, (sub_image.shape[0], sub_image.shape[1])
+        )
+        for detection in detections
+    ]
+    offset_x = i % 2 * (mid_width - int(mid_width * 0.1))
+    offset_y = i // 2 * (mid_height - int(mid_height * 0.1))
+    offset_detections = [
+        sub_image_to_original(
+            unnorm_detection, (offset_x, offset_y), (height, width)
+        )
+        for unnorm_detection in unnorm_detections
+    ]
+    detection_from_subdivided_images.extend(offset_detections)
+
+detections = merge_bounding_box_list(detection_from_subdivided_images)
 [end of suggestion 0]
 [end of suggestion]
 <count>9</count>
@@ -130,7 +185,7 @@ In these aerial images, I can see approximately 5-6 pedestrians walking in vario
 [end of claude35_vqa_output]
 
 [get_tool_for_task output]
-After examining the image, I can see it's an aerial view of a busy urban intersection with multiple lanes of traffic. There are numerous cars visible, each likely containing at least one person (the driver). While it's difficult to count exact individuals, I can estimate based on the number of vehicles. The countgd_object_detection tool is the best choice for this task as it can detect and count multiple instances of an object given a text prompt. I will use this tool to count the number of pedestrians in the image.
+After examining the image, I can see it's an aerial view of a busy urban intersection with multiple lanes of traffic. There are numerous cars visible, each likely containing at least one person (the driver). While it's difficult to count exact individuals, I can estimate based on the number of vehicles. The countgd_object_detection tool is the best choice for this task as it can detect and count multiple instances of an object given a text prompt. I will use this tool with the prompt 'pedistrian' to count the number of pedestrians in the image.
 
 Tool Documentation:
 countgd_object_detection(prompt: str, image: numpy.ndarray, box_threshold: float = 0.23) -> List[Dict[str, Any]]:
@@ -162,38 +217,46 @@ countgd_object_detection(prompt: str, image: numpy.ndarray, box_threshold: float
 [end of get_tool_for_task output]
 <count>8</count>
 
-AGENT: <thinking>I need to now merge the boxes from all regions and count the unique pedestrians.</thinking>
+AGENT: <thinking>I need to now merge the boxes from all region and use the countgd_object_detection tool with the prompt 'pedestrian' as suggested by get_tool_for_task.</thinking>
 <execute_python>
-def translate_ofset(bbox, offset_x, offset_y):
-    return (bbox[0] + offset_x, bbox[1] + offset_y, bbox[2] + offset_x, bbox[3] + offset_y)
+def bounding_box_match(b1: List[float], b2: List[float], iou_threshold: float = 0.1) -> bool:
+    # Calculate intersection coordinates
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
 
-def bounding_boxes_overlap(bbox1, bbox2):
-    if bbox1[2] < bbox2[0] or bbox2[0] > bbox1[2]:
-        return False
-    if bbox1[3] < bbox2[1] or bbox2[3] > bbox1[3]:
-        return False
-    return True
+    # Calculate intersection area
+    if x2 < x1 or y2 < y1:
+        return False  # No overlap
 
-def merge_bounding_boxes(bbox1, bbox2):
-    x_min = min(bbox1[0], bbox2[0])
-    y_min = min(bbox1[1], bbox2[1])
-    x_max = max(bbox1[2], bbox2[2])
-    y_max = max(bbox1[3], bbox2[3])
-    return (x_min, y_min, x_max, y_max)
+    intersection = (x2 - x1) * (y2 - y1)
 
-def merge_bounding_box_list(bboxes):
-    merged_bboxes = []
-    while bboxes:
-        bbox = bboxes.pop()
-        overlap_found = False
-        for i, other_bbox in enumerate(merged_bboxes):
-            if bounding_boxes_overlap(bbox, other_bbox):
-                merged_bboxes[i] = merge_bounding_boxes(bbox, other_bbox)
-                overlap_found = True
+    # Calculate union area
+    area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+    area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+    union = area1 + area2 - intersection
+
+    # Calculate IoU
+    iou = intersection / union if union > 0 else 0
+
+    return iou >= iou_threshold
+
+def merge_bounding_box_list(detections):
+    merged_detections = []
+    for detection in detections:
+        matching_box = None
+        for i, other in enumerate(merged_detections):
+            if bounding_box_match(detection["bbox"], other["bbox"]):
+                matching_box = i
                 break
-        if not overlap_found:
-            merged_bboxes.append(bbox)
-    return merged_bboxes
+
+        if matching_box is not None:
+            # Keep the box with higher confidence score
+            if detection["score"] > merged_detections[matching_box]["score"]:
+                merged_detections[matching_box] = detection
+        else:
+            merged_detections.append(detection)
 
 detections = []
 for region in subdivide_image(image):
@@ -271,7 +334,7 @@ get_tool_for_task('Identify and track the boxes in the video', frames[:5])
 
 OBSERVATION:
 [get_tool_for_task output]
-For tracking boxes moving on a conveyor belt, we need a tool that can consistently track the same box across frames without losing it or double counting. Looking at the outputs: florence2_sam2_video_tracking successfully tracks the single box across all 5 frames, maintaining consistent tracking IDs and showing the box's movement along the conveyor.
+For tracking boxes moving on a conveyor belt, we need a tool that can consistently track the same box across frames without losing it or double counting. Looking at the outputs: florence2_sam2_video_tracking successfully tracks the single box across all 5 frames, maintaining consistent tracking IDs and showing the box's movement along the conveyor and using the prompt 'box'.
 
 Tool Documentation:
 def florence2_sam2_video_tracking(prompt: str, frames: List[np.ndarray], chunk_length: Optional[int] = 10) -> List[List[Dict[str, Any]]]:
@@ -317,7 +380,7 @@ def florence2_sam2_video_tracking(prompt: str, frames: List[np.ndarray], chunk_l
 [end of get_tool_for_task output]
 <count>8</count>
 
-AGENT: <thinking>Now that I have the tool for tracking I need to find a tool to identify if there is tape on each of the boxes.</thinking>
+AGENT: <thinking>Now that I have the tool and prompt for tracking I need to find a tool to identify if there is tape on each of the boxes.</thinking>
 <execute_python>
 track_predictions = florence2_sam2_video_tracking("box", frames)
 
@@ -338,7 +401,7 @@ get_tool_for_task('Identify if there is tape on the boxes', crops[:3])
 
 OBSERVATION:
 [get_tool_for_task output]
-owlv2_object_detection performed best as it specifically detected multiple instances of tape with localized bounding boxes, which matches what's visible in the images.
+owlv2_object_detection performed best with the prompt 'tape', as it specifically detected multiple instances of tape with localized bounding boxes, which matches what's visible in the images.
 
 'owlv2_object_detection' is a tool that can detect and count multiple objects given a
 text prompt such as category names or referring expressions on images. The categories
@@ -370,7 +433,7 @@ Example
 [end of get_tool_for_task output]
 <count>7</count>
 
-AGENT: <thinking>Now that I have the tools for tracking and identifying tape on the boxes, I will use them to accomplish the user's request.</thinking>
+AGENT: <thinking>Now that I have the tools for tracking and identifying 'tape' on the boxes, I will use them to accomplish the user's request.</thinking>
 <execute_python>
 obj_to_info = {{}}
 for frame, frame_predictions in zip(frames, track_predictions):
@@ -458,6 +521,8 @@ You are given a task: "{task}" from the user. You must extract the type of categ
 - "DocQA" - answering questions about a document or extracting information from a document.
 - "video object tracking" - tracking objects in a video.
 - "depth and pose estimation" - estimating the depth or pose of objects in an image.
+- "temporal localization" - localizing the time period an event occurs in a video.
+- "inpainting" - filling in masked parts of an image.
 
 Return the category or categories (comma separated) inside tags <category># your categories here</category>. If you are unsure about a task, it is better to include more categories than less.
 """
@@ -487,8 +552,9 @@ TEST_TOOLS = """
 2. Create a dictionary where the keys are the tool name and the values are the tool outputs. Remove numpy arrays from the printed dictionary.
 3. Your test case MUST run only on the given images which are {media}
 4. For video tracking, use chunk_length=1 and at least 3 frames to ensure the best results when evaluating the tool.
-5. Print this final dictionary.
-6. Output your code in the following format wrapped in <code> tags:
+5. Use mutually exclusive categories for prompts such as 'person, car' and not 'person, athlete' to avoid over counting.
+6. Print this final dictionary.
+7. Output your code in the following format wrapped in <code> tags:
 <code>
 # Your code here
 </code>
@@ -649,58 +715,25 @@ PICK_TOOL = """
 </json>
 """
 
-PICK_TOOL_V2 = """
-**Role**: You are an expert evaluator that can understand user requests and evaluate the output of different tools.
-
-**Task**: You are given the output of different tools for a user request along with the image. You must evaluate the output and determine the best tool for the user request.
-
-**User Request**:
-{user_request}
-
-**Tools**: This is the documentation of all the functions that were tested.
-{tool_docs}
-
-**Testing Code and Tool Output**:
-{context}
-
-**Previous Attempt**: This is the code and output of the previous attempt, if it is empty then there was no previous attempt.
-{previous_attempts}
-
-**Instructions**:
-1. Re-read the user request, plans, tool outputs and examine the image.
-2. Given the user request, try to solve the problem yourself.
-3. Pick which tool output best matches your solution first and the user request, then consider other factors like box size, etc. DO NOT worry about low confidence scores if the output is correct.
-4. DO NOT modify confidence thresholds unless the tool output is completely wrong.
-5. Remember for videos that in order to count objects a video some sort of tracking is needed, or else you will overcount the objects.
-6. Assign each tool a score from 0 to 10 based on how well it solves the user request. A score of 8+ means the tool output matches your solution and the tool is the best choice, 5-7 means the tool output is okay but needs some modifications, less than 5 means the tool output is bad and the tool should not be used. Return the the following JSON format inside <json> tags using the exact tool name as the key and the score as the value:
-<json>
-{{
-    "predicted_answer": str # the answer you would expect from the best plan
-    "thoughts": str # your thought process for choosing the best tool over other tools and any modifications you madeas well as the prompt you used with the tool.
-    "first tool": int # the score for the first tool
-    "second tool": int # the score for the second tool
-    ...
-}}
-</json>
-"""
-
 FINALIZE_PLAN = """
-**Role**: You are an expert AI model that can understand the user request and construct plans to accomplish it.
+**Task**: You are given a chain of thoughts, python executions and observations from a planning agent as it tries to construct a plan to solve a user request. Your task is to summarize the plan it found so that another programming agent to write a program to accomplish the user request.
 
-**Task**: You are given a chain of thoughts, python executions and observations from a planning agent as it tries to construct a plan to solve a user request. Your task is to summarize the plan it found so that another programming agnet to write a program to accomplish the user request.
+**Documentation**: You can use these tools to help you visualize or save the output:
+{tool_desc}
 
 **Planning**: Here is chain of thoughts, executions and observations from the planning agent:
 {planning}
 
 **Instructions**:
-1. Read the chain of thoughts and python executions.
-2. Summarize the plan that the planning agent found.
-3. Include ALL relevant python code in your plan to accomplish the user request.
-4. Specifically call out the tools used and the order in which they were used. Only include tools obtained from calling `get_tool_for_task`.
-5. Do not include {excluded_tools} tools in your instructions.
-6. Add final instructions for visualizing the output with `overlay_bounding_boxes` or `overlay_segmentation_masks` and saving it to a file with `save_file` or `save_video`.
+1. Summarize the plan that the planning agent found.
+2. Write a single function that solves the problem based on what the planner found and only returns the final solution.
+3. Only use tools obtained from calling `get_tool_for_task`.
+4. Do not include {excluded_tools} tools in your instructions.
+5. Ensure the function is well documented and easy to understand.
+6. Ensure you visualize the output with `overlay_bounding_boxes` or `overlay_segmentation_masks` and save it to a file with `save_image` or `save_video`.
 7. Use the default FPS for extracting frames from videos unless otherwise specified by the user.
-8. Respond in the following format with JSON surrounded by <json> tags and code surrounded by <code> tags:
+8. Include the expected answer in your 'plan' so that the programming agent can properly test if it has the correct answer.
+9. Respond in the following format with JSON surrounded by <json> tags and code surrounded by <code> tags:
 
 <json>
 {{

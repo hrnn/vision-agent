@@ -18,31 +18,16 @@ from vision_agent.agent.types import (
 )
 from vision_agent.agent.vision_agent_coder_v2 import format_code_context
 from vision_agent.agent.vision_agent_prompts_v2 import CONVERSATION
-from vision_agent.lmm import LMM, AnthropicLMM
+from vision_agent.configs import Config
+from vision_agent.lmm import LMM
 from vision_agent.lmm.types import Message
 from vision_agent.utils.execute import CodeInterpreter, CodeInterpreterFactory
 
-
-def run_conversation(agent: LMM, chat: List[AgentMessage]) -> str:
-    # only keep last 10 messages
-    conv = format_conversation(chat[-10:])
-    prompt = CONVERSATION.format(
-        conversation=conv,
-    )
-    response = agent([{"role": "user", "content": prompt}], stream=False)
-    return cast(str, response)
+CONFIG = Config()
 
 
-def check_for_interaction(chat: List[AgentMessage]) -> bool:
-    return (
-        len(chat) > 2
-        and chat[-2].role == "interaction"
-        and chat[-1].role == "interaction_response"
-    )
-
-
-def extract_conversation_for_generate_code(
-    chat: List[AgentMessage],
+def extract_conversation(
+    chat: List[AgentMessage], include_conv: bool = False
 ) -> Tuple[List[AgentMessage], Optional[str]]:
     chat = copy.deepcopy(chat)
 
@@ -58,6 +43,8 @@ def extract_conversation_for_generate_code(
         elif chat_i.role == "coder":
             if "<final_code>" in chat_i.content:
                 extracted_chat.append(chat_i)
+        elif include_conv and chat_i.role == "conversation":
+            extracted_chat.append(chat_i)
 
     # only keep the last <final_code> and <final_test>
     final_code = None
@@ -75,7 +62,26 @@ def extract_conversation_for_generate_code(
 
         extracted_chat_strip_code = [chat_i] + extracted_chat_strip_code
 
-    return extracted_chat_strip_code[-5:], final_code
+    return extracted_chat_strip_code, final_code
+
+
+def run_conversation(agent: LMM, chat: List[AgentMessage]) -> str:
+    extracted_chat, _ = extract_conversation(chat, include_conv=True)
+
+    conv = format_conversation(extracted_chat)
+    prompt = CONVERSATION.format(
+        conversation=conv,
+    )
+    response = agent([{"role": "user", "content": prompt}], stream=False)
+    return cast(str, response)
+
+
+def check_for_interaction(chat: List[AgentMessage]) -> bool:
+    return (
+        len(chat) > 2
+        and chat[-2].role == "interaction"
+        and chat[-1].role == "interaction_response"
+    )
 
 
 def maybe_run_action(
@@ -84,8 +90,8 @@ def maybe_run_action(
     chat: List[AgentMessage],
     code_interpreter: Optional[CodeInterpreter] = None,
 ) -> Optional[List[AgentMessage]]:
+    extracted_chat, final_code = extract_conversation(chat)
     if action == "generate_or_edit_vision_code":
-        extracted_chat, _ = extract_conversation_for_generate_code(chat)
         # there's an issue here because coder.generate_code will send it's code_context
         # to the outside user via it's update_callback, but we don't necessarily have
         # access to that update_callback here, so we re-create the message using
@@ -105,16 +111,19 @@ def maybe_run_action(
                 )
             ]
     elif action == "edit_code":
-        extracted_chat, final_code = extract_conversation_for_generate_code(chat)
+        # We don't want to pass code in plan_context.code so the coder will generate
+        # new code from plan_context.plan
         plan_context = PlanContext(
-            plan="Edit the latest code observed in the fewest steps possible according to the user's feedback.",
+            plan="Edit the latest code observed in the fewest steps possible according to the user's feedback."
+            + ("<code>\n" + final_code + "\n</code>" if final_code is not None else ""),
             instructions=[
                 chat_i.content
                 for chat_i in extracted_chat
                 if chat_i.role == "user" and "<final_code>" not in chat_i.content
             ],
-            code=final_code if final_code is not None else "",
+            code="",
         )
+
         context = coder.generate_code_from_plan(
             extracted_chat, plan_context, code_interpreter=code_interpreter
         )
@@ -158,14 +167,7 @@ class VisionAgentV2(Agent):
                 that will send back intermediate conversation messages.
         """
 
-        self.agent = (
-            agent
-            if agent is not None
-            else AnthropicLMM(
-                model_name="claude-3-5-sonnet-20241022",
-                temperature=0.0,
-            )
-        )
+        self.agent = agent if agent is not None else CONFIG.create_agent()
         self.coder = (
             coder
             if coder is not None
@@ -261,7 +263,7 @@ class VisionAgentV2(Agent):
                 # do not append updated_chat to return_chat becuase the observation
                 # from running the action will have already been added via the callbacks
                 obs_response_context = run_conversation(
-                    self.agent, return_chat + updated_chat
+                    self.agent, int_chat + return_chat + updated_chat
                 )
                 return_chat.append(
                     AgentMessage(role="conversation", content=obs_response_context)

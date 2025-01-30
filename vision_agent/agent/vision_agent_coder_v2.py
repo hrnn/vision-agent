@@ -26,7 +26,8 @@ from vision_agent.agent.types import (
 )
 from vision_agent.agent.vision_agent_coder_prompts_v2 import CODE, FIX_BUG, TEST
 from vision_agent.agent.vision_agent_planner_v2 import VisionAgentPlannerV2
-from vision_agent.lmm import LMM, AnthropicLMM
+from vision_agent.configs import Config
+from vision_agent.lmm import LMM
 from vision_agent.lmm.types import Message
 from vision_agent.tools.meta_tools import get_diff
 from vision_agent.utils.execute import (
@@ -36,6 +37,7 @@ from vision_agent.utils.execute import (
 )
 from vision_agent.utils.sim import Sim, get_tool_recommender
 
+CONFIG = Config()
 _CONSOLE = Console()
 
 
@@ -185,23 +187,17 @@ def debug_code(
     return code, test, debug_info
 
 
-def write_and_test_code(
-    coder: LMM,
+def test_code(
     tester: LMM,
     debugger: LMM,
     chat: List[AgentMessage],
     plan: str,
+    code: str,
     tool_docs: str,
     code_interpreter: CodeInterpreter,
     media_list: List[Union[str, Path]],
     verbose: bool,
 ) -> CodeContext:
-    code = write_code(
-        coder=coder,
-        chat=chat,
-        tool_docs=tool_docs,
-        plan=plan,
-    )
     try:
         code = strip_function_calls(code)
     except Exception:
@@ -257,6 +253,36 @@ def write_and_test_code(
     )
 
 
+def write_and_test_code(
+    coder: LMM,
+    tester: LMM,
+    debugger: LMM,
+    chat: List[AgentMessage],
+    plan: str,
+    tool_docs: str,
+    code_interpreter: CodeInterpreter,
+    media_list: List[Union[str, Path]],
+    verbose: bool,
+) -> CodeContext:
+    code = write_code(
+        coder=coder,
+        chat=chat,
+        tool_docs=tool_docs,
+        plan=plan,
+    )
+    return test_code(
+        tester,
+        debugger,
+        chat,
+        plan,
+        code,
+        tool_docs,
+        code_interpreter,
+        media_list,
+        verbose,
+    )
+
+
 class VisionAgentCoderV2(AgentCoder):
     """VisionAgentCoderV2 is an agent that will write vision code for you."""
 
@@ -300,21 +326,9 @@ class VisionAgentCoderV2(AgentCoder):
             )
         )
 
-        self.coder = (
-            coder
-            if coder is not None
-            else AnthropicLMM(model_name="claude-3-5-sonnet-20241022", temperature=0.0)
-        )
-        self.tester = (
-            tester
-            if tester is not None
-            else AnthropicLMM(model_name="claude-3-5-sonnet-20241022", temperature=0.0)
-        )
-        self.debugger = (
-            debugger
-            if debugger is not None
-            else AnthropicLMM(model_name="claude-3-5-sonnet-20241022", temperature=0.0)
-        )
+        self.coder = coder if coder is not None else CONFIG.create_coder()
+        self.tester = tester if tester is not None else CONFIG.create_tester()
+        self.debugger = debugger if debugger is not None else CONFIG.create_debugger()
         if tool_recommender is not None:
             if isinstance(tool_recommender, str):
                 self.tool_recommender = Sim.load(tool_recommender)
@@ -411,6 +425,8 @@ class VisionAgentCoderV2(AgentCoder):
             chat (List[AgentMessage]): The input to the agent. This should be a list of
                 AgentMessage objects.
             plan_context (PlanContext): The plan context that was previously generated.
+                If plan_context.code is not provided, then the code will be generated
+                from the chat messages.
             code_interpreter (Optional[CodeInterpreter]): The code interpreter to use.
 
         Returns:
@@ -427,7 +443,7 @@ class VisionAgentCoderV2(AgentCoder):
 
         # we don't need the user_interaction response for generating code since it's
         # already in the plan context
-        while chat[-1].role != "user":
+        while len(chat) > 0 and chat[-1].role != "user":
             chat.pop()
 
         if not chat:
@@ -440,12 +456,25 @@ class VisionAgentCoderV2(AgentCoder):
         ) as code_interpreter:
             int_chat, _, media_list = add_media_to_chat(chat, code_interpreter)
             tool_docs = retrieve_tools(plan_context.instructions, self.tool_recommender)
-            code_context = write_and_test_code(
-                coder=self.coder,
+
+            # If code is not provided from the plan_context then generate it, else use
+            # the provided code and start with testing
+            if not plan_context.code.strip():
+                code = write_code(
+                    coder=self.coder,
+                    chat=int_chat,
+                    tool_docs=tool_docs,
+                    plan=format_plan_v2(plan_context),
+                )
+            else:
+                code = plan_context.code
+
+            code_context = test_code(
                 tester=self.tester,
                 debugger=self.debugger,
                 chat=int_chat,
                 plan=format_plan_v2(plan_context),
+                code=code,
                 tool_docs=tool_docs,
                 code_interpreter=code_interpreter,
                 media_list=media_list,

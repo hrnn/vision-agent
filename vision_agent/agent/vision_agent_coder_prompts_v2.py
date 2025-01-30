@@ -6,7 +6,7 @@ FEEDBACK = """
 
 
 CODE = """
-**Role**: You are an expoert software programmer.
+**Role**: You are an expert software programmer.
 
 **Task**: You are given a plan by a planning agent that solves a vision problem posed by the user. You are also given code snippets that the planning agent used to solve the task. Your job is to organize the code so that it can be easily called by the user to solve the task.
 
@@ -77,7 +77,7 @@ This is the documentation for the functions you have access to. You may call any
 
 
 FIX_BUG = """
-**Role**: As a coder, your job is to find the error in the code and fix it. You are running in a notebook setting so you can run !pip install to install missing packages.
+**Role** As a coder, your job is to find the error in the code and fix it. You are running in a notebook setting but do not run !pip install to install new packages.
 
 **Task**: A previous agent has written some code and some testing code according to a plan given to it. It has introduced a bug into it's code while trying to implement the plan. You are given the plan, code, test code and error. Your job is to fix the error in the code or test code.
 

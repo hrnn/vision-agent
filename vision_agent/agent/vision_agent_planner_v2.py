@@ -21,6 +21,7 @@ from vision_agent.agent.agent_utils import (
     extract_tag,
     print_code,
     print_table,
+    remove_installs_from_code,
 )
 from vision_agent.agent.types import AgentMessage, InteractionContext, PlanContext
 from vision_agent.agent.vision_agent_planner_prompts_v2 import (
@@ -32,7 +33,8 @@ from vision_agent.agent.vision_agent_planner_prompts_v2 import (
     PICK_PLAN,
     PLAN,
 )
-from vision_agent.lmm import LMM, AnthropicLMM, Message
+from vision_agent.configs import Config
+from vision_agent.lmm import LMM, Message
 from vision_agent.tools.planner_tools import check_function_call, get_tool_documentation
 from vision_agent.utils.execute import (
     CodeInterpreter,
@@ -41,6 +43,7 @@ from vision_agent.utils.execute import (
 )
 
 logging.basicConfig(level=logging.INFO)
+CONFIG = Config()
 UTIL_DOCSTRING = T.get_tool_documentation(
     [
         T.load_image,
@@ -95,8 +98,7 @@ def run_planning(
     media_list: List[Union[str, Path]],
     model: LMM,
 ) -> str:
-    # only keep last 10 messages for planning
-    planning = get_planning(chat[-10:])
+    planning = get_planning(chat)
     prompt = PLAN.format(
         tool_desc=PLANNING_TOOLS_DOCSTRING,
         examples=f"{EXAMPLE_PLAN1}\n{EXAMPLE_PLAN2}",
@@ -179,6 +181,7 @@ def run_critic(
 
 
 def code_safeguards(code: str) -> str:
+    code = remove_installs_from_code(code)
     if "get_tool_for_task" in code:
         lines = code.split("\n")
         new_lines = []
@@ -315,8 +318,8 @@ def maybe_run_code(
 
 
 def create_finalize_plan(
-    chat: List[AgentMessage],
     model: LMM,
+    chat: List[AgentMessage],
     verbose: bool = False,
 ) -> Tuple[List[AgentMessage], PlanContext]:
     # if we're in the middle of an interaction, don't finalize the plan
@@ -324,6 +327,7 @@ def create_finalize_plan(
         return [], PlanContext(plan="", instructions=[], code="")
 
     prompt = FINALIZE_PLAN.format(
+        tool_desc=UTIL_DOCSTRING,
         planning=get_planning(chat),
         excluded_tools=str([t.__name__ for t in pt.PLANNER_TOOLS]),
     )
@@ -369,7 +373,7 @@ def replace_interaction_with_obs(chat: List[AgentMessage]) -> List[AgentMessage]
                 function_name = response["function_name"]
                 tool_doc = get_tool_documentation(function_name)
                 if "box_threshold" in response:
-                    tool_doc = f"Use the following function with box_threshold={response['box_threshold']}\n\n{tool_doc}"
+                    tool_doc = f"Use the following function with box_threshold={response['box_threshold']}. This tool and its parameters were chosen by the user so do not change them in your planning.\n\n{tool_doc}."
                 new_chat.append(AgentMessage(role="observation", content=tool_doc))
             except (json.JSONDecodeError, KeyError):
                 raise ValueError(f"Invalid JSON in interaction response: {chat_i}")
@@ -385,6 +389,7 @@ class VisionAgentPlannerV2(AgentPlanner):
     def __init__(
         self,
         planner: Optional[LMM] = None,
+        summarizer: Optional[LMM] = None,
         critic: Optional[LMM] = None,
         max_steps: int = 10,
         use_multi_trial_planning: bool = False,
@@ -414,16 +419,11 @@ class VisionAgentPlannerV2(AgentPlanner):
                 that will send back intermediate conversation messages.
         """
 
-        self.planner = (
-            planner
-            if planner is not None
-            else AnthropicLMM(model_name="claude-3-5-sonnet-20241022", temperature=0.0)
+        self.planner = planner if planner is not None else CONFIG.create_planner()
+        self.summarizer = (
+            summarizer if summarizer is not None else CONFIG.create_summarizer()
         )
-        self.critic = (
-            critic
-            if critic is not None
-            else AnthropicLMM(model_name="claude-3-5-sonnet-20241022", temperature=0.0)
-        )
+        self.critic = critic if critic is not None else CONFIG.create_critic()
         self.max_steps = max_steps
         self.use_multi_trial_planning = use_multi_trial_planning
         self.critique_steps = critique_steps
@@ -515,6 +515,7 @@ class VisionAgentPlannerV2(AgentPlanner):
                 code = extract_tag(response, "execute_python")
                 finalize_plan = extract_tag(response, "finalize_plan")
                 finished = finalize_plan is not None
+                self.update_callback({"role": "planner_update", "content": response})
 
                 if self.verbose:
                     _CONSOLE.print(
@@ -561,7 +562,7 @@ class VisionAgentPlannerV2(AgentPlanner):
                 context = InteractionContext(chat=int_chat)
             else:
                 updated_chat, context = create_finalize_plan(
-                    int_chat, self.planner, self.verbose
+                    self.summarizer, int_chat, self.verbose
                 )
                 int_chat.extend(updated_chat)
                 for chat_elt in updated_chat:

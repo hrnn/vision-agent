@@ -148,8 +148,10 @@ def format_plan_v2(plan: PlanContext) -> str:
     plan_str += "Instructions:\n"
     for v in plan.instructions:
         plan_str += f"    - {v}\n"
-    plan_str += "Code:\n"
-    plan_str += plan.code
+
+    if plan.code:
+        plan_str += "Code:\n"
+        plan_str += plan.code
     return plan_str
 
 
@@ -157,10 +159,11 @@ def format_conversation(chat: List[AgentMessage]) -> str:
     chat = copy.deepcopy(chat)
     prompt = ""
     for chat_i in chat:
-        if chat_i.role == "user":
-            prompt += f"USER: {chat_i.content}\n\n"
-        elif chat_i.role == "observation" or chat_i.role == "coder":
-            prompt += f"OBSERVATION: {chat_i.content}\n\n"
+        if chat_i.role == "user" or chat_i.role == "coder":
+            if "<final_code>" in chat_i.content:
+                prompt += f"OBSERVATION: {chat_i.content}\n\n"
+            elif chat_i.role == "user":
+                prompt += f"USER: {chat_i.content}\n\n"
         elif chat_i.role == "conversation":
             prompt += f"AGENT: {chat_i.content}\n\n"
     return prompt
@@ -332,26 +335,26 @@ def strip_function_calls(  # noqa: C901
         def __init__(self, exclusions: List[str]):
             # Store exclusions to skip removing certain function calls
             self.exclusions = exclusions
-            self.in_function_or_class = False
+            self.in_function_or_class: List[bool] = []
 
         def visit_FunctionDef(self, node: cst.FunctionDef) -> Optional[bool]:
-            self.in_function_or_class = True
+            self.in_function_or_class.append(True)
             return True
 
         def leave_FunctionDef(
             self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
         ) -> cst.BaseStatement:
-            self.in_function_or_class = False
+            self.in_function_or_class.pop()
             return updated_node
 
         def visit_ClassDef(self, node: cst.ClassDef) -> Optional[bool]:
-            self.in_function_or_class = True
+            self.in_function_or_class.append(True)
             return True
 
         def leave_ClassDef(
             self, node: cst.ClassDef, updated_node: cst.ClassDef
         ) -> cst.BaseStatement:
-            self.in_function_or_class = False
+            self.in_function_or_class.pop()
             return updated_node
 
         def leave_Expr(
